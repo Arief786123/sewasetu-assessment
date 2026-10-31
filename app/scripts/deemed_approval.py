@@ -32,10 +32,10 @@ SMS_GATEWAY_URL = os.environ.get("SMS_GATEWAY_URL", config.get("app", "sms_gatew
 
 def main():
     conn = psycopg2.connect(
-        host=config.get("database", "host"),
-        port=config.get("database", "port"),
-        dbname=config.get("database", "name"),
-        user=config.get("database", "user"),
+        host=os.environ.get("DB_HOST", config.get("database", "host")),
+        port=int(os.environ.get("DB_PORT", config.get("database", "port"))),
+        dbname=os.environ.get("DB_NAME", config.get("database", "name")),
+        user=os.environ.get("DB_USER", config.get("database", "user")),
         password=os.environ.get("DB_PASSWORD", config.get("database", "password")),
         connect_timeout=5,
         application_name="sewasetu-scheduler",

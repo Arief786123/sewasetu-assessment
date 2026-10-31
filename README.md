@@ -51,10 +51,11 @@ delete existing citizen rows. `app/schema.sql` initializes the schema and suppor
 
 ## Production configuration
 
-Use a VM/VPS with persistent disk and Docker Compose; do not use an ephemeral/free tier that
-sleeps or discards the PostgreSQL volume. Configure a firewall to expose only TCP 80/443 (or
-the assessment port), terminate TLS with a reverse proxy, and keep PostgreSQL/SMS gateway
-private to the Docker network. Set the following in `.env` before deployment:
+Use a VM/VPS with persistent disk and Docker Compose, or translate the Compose services into
+separate Railway services. Do not use an ephemeral/free tier that sleeps or discards the
+PostgreSQL volume. Configure a firewall to expose only TCP 80/443 (or the assessment port),
+terminate TLS with a reverse proxy, and keep PostgreSQL/SMS gateway private to the app network.
+Set the following in `.env` before a Compose deployment:
 
 - `APP_ENV=production`
 - `SECRET_KEY`: at least 32 random bytes
@@ -62,6 +63,14 @@ private to the Docker network. Set the following in `.env` before deployment:
 - `DB_PASSWORD`: unique database password
 - `SCHEME_DEADLINE`: only set an extended assessment window when authorized; the shipped
   business-rule deadline remains in `app/config/app.ini`.
+
+For Railway, create four services: managed PostgreSQL, the `app/` Docker service, the
+`smsgw/` Docker service, and a scheduler using the `app/` Dockerfile with start command
+`cron -f`. Set `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and
+`SMS_GATEWAY_URL` from Railway's private service references. The app image listens on Railway's
+`PORT`. Run `app/schema.sql` once against the empty PostgreSQL service, then import the supplied
+`seed/seed.sql` once. Railway maps each Compose service separately; it does not execute the
+Compose file as a single deployment.
 
 The admin panel is at `/admin`. The assessor credentials are the values in the deployment
 `.env`; do not commit `.env` or send it in the repository ZIP. `APP_ENV=production` enables

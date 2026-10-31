@@ -15,4 +15,4 @@ RUN mkdir -p /var/sewasetu/uploads /var/log/sewasetu \
     && chown -R sewasetu:sewasetu /app /var/sewasetu /var/log/sewasetu
 
 EXPOSE 8000
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "4", "--threads", "1", "--timeout", "30", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 4 --threads 1 --timeout 30 --access-logfile - --error-logfile - app:app"]

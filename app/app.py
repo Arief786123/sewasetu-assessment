@@ -53,7 +53,7 @@ if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = secrets.token_urlsafe(24)
     app.logger.warning("Temporary development admin password generated; set ADMIN_PASSWORD explicitly.")
 
-SMS_GATEWAY_URL = config.get("app", "sms_gateway_url")
+SMS_GATEWAY_URL = os.environ.get("SMS_GATEWAY_URL", config.get("app", "sms_gateway_url"))
 OTP_VALIDITY_SECONDS = config.getint("app", "otp_validity_seconds")
 UPLOAD_DIR = config.get("app", "upload_dir")
 SCHEME_DEADLINE = datetime.strptime(
@@ -104,10 +104,10 @@ def get_db():
             if _db_pool is None:
                 _db_pool = ThreadedConnectionPool(
                     minconn=1, maxconn=int(os.environ.get("DB_POOL_MAX", "4")),
-                    host=config.get("database", "host"),
-                    port=config.getint("database", "port"),
-                    dbname=config.get("database", "name"),
-                    user=config.get("database", "user"),
+                    host=os.environ.get("DB_HOST", config.get("database", "host")),
+                    port=int(os.environ.get("DB_PORT", config.get("database", "port"))),
+                    dbname=os.environ.get("DB_NAME", config.get("database", "name")),
+                    user=os.environ.get("DB_USER", config.get("database", "user")),
                     password=os.environ.get("DB_PASSWORD", config.get("database", "password")),
                     connect_timeout=5,
                     application_name="sewasetu-web",
