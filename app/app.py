@@ -461,6 +461,9 @@ def handle_submission():
         out.write(pdf_bytes)
 
     cur.close(); conn.close()
+    # Permit this browser session to download the acknowledgement just created.
+    # Access is restricted to this single application ID.
+    session["ack_access_app_id"] = new_id
     session.pop("form_data", None)
     session.pop("doc_path", None)
     session.pop("verified_mobile", None)
@@ -561,7 +564,8 @@ def view_application(app_id):
 @app.route("/ack/<int:app_id>.pdf")
 def ack_pdf(app_id):
     if not session.get("admin_authenticated"):
-        if not session.get("citizen_authenticated"):
+        if (not session.get("citizen_authenticated") and
+                session.get("ack_access_app_id") != app_id):
             abort(403)
         check_conn = get_db()
         check_cur = check_conn.cursor()
