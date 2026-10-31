@@ -34,8 +34,9 @@ config.read(os.path.join(BASE_DIR, "config", "app.ini"))
 app = Flask(__name__)
 APP_ENV = os.environ.get("APP_ENV", "development").lower()
 SECRET_KEY = os.environ.get("SECRET_KEY")
-if APP_ENV == "production" and not SECRET_KEY:
-    raise RuntimeError("SECRET_KEY must be set in production")
+if APP_ENV == "production" and (not SECRET_KEY or SECRET_KEY.startswith("REPLACE_") or
+                                 SECRET_KEY == "local-development-only-change-me"):
+    raise RuntimeError("Set a unique SECRET_KEY in production; do not use the example value")
 app.secret_key = SECRET_KEY or secrets.token_hex(32)
 app.config.update(
     PERMANENT_SESSION_LIFETIME=1800,
@@ -47,11 +48,15 @@ app.config.update(
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
-if not ADMIN_PASSWORD and APP_ENV == "production":
-    raise RuntimeError("ADMIN_PASSWORD must be set in production")
+if APP_ENV == "production" and (not ADMIN_PASSWORD or ADMIN_PASSWORD.startswith("REPLACE_")):
+    raise RuntimeError("Set a unique ADMIN_PASSWORD in production")
 if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = secrets.token_urlsafe(24)
     app.logger.warning("Temporary development admin password generated; set ADMIN_PASSWORD explicitly.")
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
+if APP_ENV == "production" and (not DB_PASSWORD or DB_PASSWORD.startswith("REPLACE_") or
+                                 DB_PASSWORD == "local-dev-only-change-me"):
+    raise RuntimeError("Set a unique DB_PASSWORD in production")
 
 SMS_GATEWAY_URL = os.environ.get("SMS_GATEWAY_URL", config.get("app", "sms_gateway_url"))
 OTP_VALIDITY_SECONDS = config.getint("app", "otp_validity_seconds")
@@ -108,7 +113,7 @@ def get_db():
                     port=int(os.environ.get("DB_PORT", config.get("database", "port"))),
                     dbname=os.environ.get("DB_NAME", config.get("database", "name")),
                     user=os.environ.get("DB_USER", config.get("database", "user")),
-                    password=os.environ.get("DB_PASSWORD", config.get("database", "password")),
+                    password=DB_PASSWORD or config.get("database", "password"),
                     connect_timeout=5,
                     application_name="sewasetu-web",
                 )
@@ -594,13 +599,22 @@ def reset_password():
             cur.execute("SELECT 1 FROM portal_users WHERE mobile = %s", (mobile,))
             exists = cur.fetchone()
             if exists:
-                code = "%06d" % secrets.randbelow(1000000)
-                code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
-                cur.execute("INSERT INTO otps (mobile, code, created_at) VALUES (%s,%s,%s)",
-                            (mobile, code_hash, datetime.now()))
-                conn.commit()
-                if send_sms(mobile, "Sewa Setu password reset OTP: %s. Valid for 5 minutes." % code):
-                    session["reset_mobile"] = mobile
+                cur.execute("SELECT created_at FROM otps WHERE mobile = %s ORDER BY id DESC LIMIT 1",
+                            (mobile,))
+                previous = cur.fetchone()
+                if previous and (datetime.now() - previous[0]).total_seconds() < 60:
+                    flash("Please wait one minute before requesting another reset code.")
+                else:
+                    code = "%06d" % secrets.randbelow(1000000)
+                    code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
+                    cur.execute("INSERT INTO otps (mobile, code, created_at) VALUES (%s,%s,%s)",
+                                (mobile, code_hash, datetime.now()))
+                    conn.commit()
+                    if send_sms(mobile, "Sewa Setu password reset OTP: %s. Valid for 5 minutes." % code):
+                        session["reset_mobile"] = mobile
+                    else:
+                        cur.execute("DELETE FROM otps WHERE mobile = %s", (mobile,))
+                        conn.commit()
             cur.close(); conn.close()
             flash("If the mobile number is registered, a reset OTP has been sent.")
             return render_template("reset.html", otp_sent=bool(session.get("reset_mobile")))
