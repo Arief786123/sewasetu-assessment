@@ -16,16 +16,18 @@ from datetime import datetime, timedelta
 
 import psycopg2
 import requests
+import logging
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("sewasetu.scheduler")
 
 config = configparser.ConfigParser()
-CONFIG_PATH = os.path.join(BASE_DIR, "config", "settings.ini")
-with open(CONFIG_PATH) as fh:
-    config.read_file(fh)
+CONFIG_PATH = os.path.join(BASE_DIR, "config", "app.ini")
+config.read(CONFIG_PATH)
 
-SLA_DAYS = config.getint("pension", "sla_days")
-SMS_GATEWAY_URL = config.get("app", "sms_gateway_url")
+SLA_DAYS = int(os.environ.get("SLA_DAYS", config.get("pension", "sla_days")))
+SMS_GATEWAY_URL = os.environ.get("SMS_GATEWAY_URL", config.get("app", "sms_gateway_url"))
 
 
 def main():
@@ -34,7 +36,9 @@ def main():
         port=config.get("database", "port"),
         dbname=config.get("database", "name"),
         user=config.get("database", "user"),
-        password=config.get("database", "password"),
+        password=os.environ.get("DB_PASSWORD", config.get("database", "password")),
+        connect_timeout=5,
+        application_name="sewasetu-scheduler",
     )
     cur = conn.cursor()
     cutoff = datetime.now() - timedelta(days=SLA_DAYS)
@@ -48,12 +52,13 @@ def main():
     conn.commit()
     for app_no, mobile in rows:
         try:
-            requests.post(SMS_GATEWAY_URL + "/api/send", json={
+            response = requests.post(SMS_GATEWAY_URL + "/api/send", json={
                 "to": mobile,
                 "text": "Sewa Setu: your pension application %s stands approved "
-                        "under the RTPS Act." % app_no}, timeout=5)
-        except Exception:
-            pass
+                        "under the RTPS Act." % app_no}, timeout=(2, 4))
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.error("SMS notification failed for application %s: %s", app_no, exc)
     print("%s deemed approval: %d applications approved"
           % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), len(rows)))
     cur.close()

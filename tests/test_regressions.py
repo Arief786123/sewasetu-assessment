@@ -39,6 +39,7 @@ class FakeCursor:
 
 class FakeConnection:
     def __init__(self, cursor=None):
+        self.closed = 0
         self.cur = cursor or FakeCursor()
 
     def cursor(self):

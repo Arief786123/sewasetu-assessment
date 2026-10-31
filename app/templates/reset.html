@@ -3,7 +3,13 @@
 <h2>Reset Password</h2>
 <form method="post">
   <label>Registered Mobile Number</label>
-  <input type="text" name="mobile">
-  <p><button class="btn" type="submit">Reset Password</button></p>
+  <input type="text" name="mobile" maxlength="10" inputmode="numeric" required>
+  {% if otp_sent %}
+  <label>SMS verification code</label>
+  <input type="text" name="otp" maxlength="6" inputmode="numeric" required>
+  <label>New password (at least 10 characters)</label>
+  <input type="password" name="password" minlength="10" required>
+  {% endif %}
+  <p><button class="btn" type="submit">{% if otp_sent %}Update Password{% else %}Send Reset Code{% endif %}</button></p>
 </form>
 {% endblock %}

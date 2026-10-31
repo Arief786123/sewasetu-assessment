@@ -12,13 +12,18 @@ import io
 import csv
 import random
 import hashlib
+import hmac
+import secrets
+import threading
 import configparser
 from datetime import datetime, date, timedelta
 
 import requests
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool, PoolError
+from werkzeug.security import check_password_hash, generate_password_hash
 from flask import (Flask, request, session, redirect, url_for, render_template,
-                   flash, send_file, abort, jsonify)
+                   flash, send_file, abort, jsonify, g)
 from fpdf import FPDF
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,17 +32,33 @@ config = configparser.ConfigParser()
 config.read(os.path.join(BASE_DIR, "config", "app.ini"))
 
 app = Flask(__name__)
-app.secret_key = config.get("app", "secret_key")
-app.config["PERMANENT_SESSION_LIFETIME"] = 300
+APP_ENV = os.environ.get("APP_ENV", "development").lower()
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if APP_ENV == "production" and not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY must be set in production")
+app.secret_key = SECRET_KEY or secrets.token_hex(32)
+app.config.update(
+    PERMANENT_SESSION_LIFETIME=1800,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=(APP_ENV == "production"),
+    MAX_CONTENT_LENGTH=102400,
+)
 
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "sewasetu@123"
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+if not ADMIN_PASSWORD and APP_ENV == "production":
+    raise RuntimeError("ADMIN_PASSWORD must be set in production")
+if not ADMIN_PASSWORD:
+    ADMIN_PASSWORD = secrets.token_urlsafe(24)
+    app.logger.warning("Temporary development admin password generated; set ADMIN_PASSWORD explicitly.")
 
 SMS_GATEWAY_URL = config.get("app", "sms_gateway_url")
 OTP_VALIDITY_SECONDS = config.getint("app", "otp_validity_seconds")
 UPLOAD_DIR = config.get("app", "upload_dir")
-SCHEME_DEADLINE = datetime.strptime(config.get("pension", "scheme_deadline"),
-                                    "%Y-%m-%d %H:%M")
+SCHEME_DEADLINE = datetime.strptime(
+    os.environ.get("SCHEME_DEADLINE", config.get("pension", "scheme_deadline")),
+    "%Y-%m-%d %H:%M")
 MIN_AGE = config.getint("pension", "min_age")
 SLA_DAYS = config.getint("pension", "sla_days")
 
@@ -55,36 +76,87 @@ except Exception:
     pass
 
 
+# Gunicorn runs separate worker processes. Initialize one bounded pool lazily
+# inside each worker; never create a pool in the master process.
+_db_pool = None
+_db_pool_lock = threading.Lock()
+
+class PooledConnection:
+    """Expose a psycopg2 connection while making close() return it to the pool."""
+    def __init__(self, pool, connection):
+        self._pool = pool
+        self._connection = connection
+        self._released = False
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def close(self):
+        if not self._released:
+            self._released = True
+            self._pool.putconn(self._connection, close=self._connection.closed != 0)
+
+
 def get_db():
-    return psycopg2.connect(
-        host=config.get("database", "host"),
-        port=config.get("database", "port"),
-        dbname=config.get("database", "name"),
-        user=config.get("database", "user"),
-        password=config.get("database", "password"),
-    )
+    global _db_pool
+    if _db_pool is None:
+        with _db_pool_lock:
+            if _db_pool is None:
+                _db_pool = ThreadedConnectionPool(
+                    minconn=1, maxconn=int(os.environ.get("DB_POOL_MAX", "4")),
+                    host=config.get("database", "host"),
+                    port=config.getint("database", "port"),
+                    dbname=config.get("database", "name"),
+                    user=config.get("database", "user"),
+                    password=os.environ.get("DB_PASSWORD", config.get("database", "password")),
+                    connect_timeout=5,
+                    application_name="sewasetu-web",
+                )
+    try:
+        connection = PooledConnection(_db_pool, _db_pool.getconn())
+        if not hasattr(g, "_db_connections"):
+            g._db_connections = set()
+        g._db_connections.add(connection)
+        return connection
+    except PoolError:
+        app.logger.error("database connection pool exhausted")
+        raise
 
 
-def sanitize(value, maxlen=20):
-    # Trim input to safe length for downstream systems (NIC mandate 2019:
-    # legacy disbursement interface accepts fixed-width fields).
-    if value is None:
-        return ""
-    value = value.strip()
-    encoded = value.encode("utf-8")[:maxlen]
-    return encoded.decode("utf-8", errors="ignore")
+@app.teardown_appcontext
+def release_db_connections(_error=None):
+    # Also release connections on exceptional request paths, not only explicit
+    # close() calls. PooledConnection.close() is idempotent.
+    for connection in getattr(g, "_db_connections", set()):
+        connection.close()
 
 
-def hash_password(p):
-    return hashlib.sha256(p.encode("utf-8")).hexdigest()
+def verify_portal_password(stored, supplied):
+    """Verify modern hashes and transparently upgrade legacy SHA-256 hashes."""
+    if not stored:
+        return False, None
+    if stored.startswith(("pbkdf2:", "scrypt:")):
+        return check_password_hash(stored, supplied), None
+    legacy = hashlib.sha256(supplied.encode("utf-8")).hexdigest()
+    if hmac.compare_digest(stored, legacy):
+        return True, generate_password_hash(supplied)
+    return False, None
+
+
+def normalize_citizen_name(value):
+    """Trim surrounding whitespace without byte-truncating Unicode names."""
+    return (value or "").strip()[:100]
 
 
 def send_sms(mobile, text):
     try:
-        requests.post(SMS_GATEWAY_URL + "/api/send",
-                      json={"to": mobile, "text": text}, timeout=5)
-    except Exception as e:
+        response = requests.post(SMS_GATEWAY_URL + "/api/send",
+                                 json={"to": mobile, "text": text}, timeout=(2, 4))
+        response.raise_for_status()
+        return True
+    except requests.RequestException as e:
         app.logger.error("sms gateway error: %s" % e)
+        return False
 
 
 def deadline_remaining():
@@ -101,6 +173,27 @@ def new_application_no():
 # ---------------------------------------------------------------------------
 # Public pages
 # ---------------------------------------------------------------------------
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if APP_ENV == "production":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
+
+@app.route("/healthz")
+def healthz():
+    connection = get_db()
+    cursor = connection.cursor()
+    cursor.execute("SELECT 1")
+    cursor.fetchone()
+    cursor.close(); connection.close()
+    return jsonify({"status": "ok", "database": "ready"}), 200
+
 
 @app.route("/")
 def index():
@@ -138,18 +231,34 @@ def apply():
         return redirect(url_for("index"))
     if request.method == "POST":
         mobile = request.form.get("mobile", "").strip()
-        captcha = request.form.get("captcha", "")
+        captcha = request.form.get("captcha", "").strip()
+        expected_captcha = session.pop("captcha_answer", None)
+        if expected_captcha is None or not captcha.isdigit() or int(captcha) != expected_captcha:
+            flash("Security check failed. Please try again.")
+            return render_template("apply.html", captcha_q=make_captcha())
         if len(mobile) != 10 or not mobile.isdigit():
             flash("Something went wrong. Please try again.")
             return render_template("apply.html", captcha_q=make_captcha())
-        code = str(random.randint(100000, 999999))
+        code = "%06d" % secrets.randbelow(1000000)
         conn = get_db()
         cur = conn.cursor()
+        cur.execute("SELECT created_at FROM otps WHERE mobile = %s ORDER BY id DESC LIMIT 1", (mobile,))
+        previous = cur.fetchone()
+        if previous and (datetime.now() - previous[0]).total_seconds() < 60:
+            cur.close(); conn.close()
+            flash("Please wait one minute before requesting another OTP.")
+            return render_template("apply.html", captcha_q=make_captcha())
+        code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
         cur.execute("INSERT INTO otps (mobile, code, created_at) VALUES (%s, %s, %s)",
-                    (mobile, code, datetime.now()))
+                    (mobile, code_hash, datetime.now()))
         conn.commit()
         cur.close(); conn.close()
-        send_sms(mobile, "Your Sewa Setu OTP is %s. Valid for 5 minutes." % code)
+        if not send_sms(mobile, "Your Sewa Setu OTP is %s. Valid for 5 minutes." % code):
+            cleanup = get_db(); cleanup_cur = cleanup.cursor()
+            cleanup_cur.execute("DELETE FROM otps WHERE mobile = %s", (mobile,))
+            cleanup.commit(); cleanup_cur.close(); cleanup.close()
+            flash("SMS delivery is temporarily unavailable. Please try again shortly.")
+            return render_template("apply.html", captcha_q=make_captcha())
         session.permanent = True
         session["apply_mobile"] = mobile
         return redirect(url_for("verify"))
@@ -169,21 +278,33 @@ def verify():
         return redirect(url_for("apply"))
     if request.method == "POST":
         code = request.form.get("otp", "").strip()
+        attempts = int(session.get("otp_attempts", 0))
+        if attempts >= 5:
+            session.pop("apply_mobile", None)
+            session.pop("otp_attempts", None)
+            flash("Too many incorrect OTP attempts. Please request a new OTP.")
+            return redirect(url_for("apply"))
         conn = get_db()
         cur = conn.cursor()
         cur.execute("SELECT code, created_at FROM otps WHERE mobile = %s "
                     "ORDER BY id DESC LIMIT 1", (mobile,))
         row = cur.fetchone()
-        cur.close(); conn.close()
-        if row and row[0] == code:
+        submitted_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        if row and hmac.compare_digest(str(row[0]), submitted_hash):
             age = (datetime.now() - row[1]).total_seconds()
             if age > OTP_VALIDITY_SECONDS:
+                cur.close(); conn.close()
                 app.logger.warning("otp expired mobile=%s age=%ds" % (mobile, int(age)))
                 flash("OTP expired. Please request a new OTP.")
                 return redirect(url_for("apply"))
+            cur.execute("DELETE FROM otps WHERE mobile = %s", (mobile,))
+            conn.commit()
+            cur.close(); conn.close()
+            session.pop("otp_attempts", None)
             session["verified_mobile"] = mobile
             return redirect(url_for("form_step", step=1))
-        flash("Invalid OTP.")
+        session["otp_attempts"] = attempts + 1
+        flash("Invalid OTP. Please check the code and try again.")
     return render_template("verify.html", mobile=mobile)
 
 
@@ -217,15 +338,16 @@ def upload():
             flash("ERR_VAL_47")
             return render_template("upload.html")
         filename = f.filename.lower()
-        content = f.read()
-        if not filename.endswith(".pdf"):
-            flash("ERR_VAL_47")
+        content = f.read(102401)
+        if not filename.endswith(".pdf") or not content.startswith(b"%PDF-"):
+            flash("Please upload a valid PDF document.")
             return render_template("upload.html")
         if len(content) > 102400:
-            flash("ERR_VAL_47")
+            flash("The PDF must be 100 KB or smaller.")
             return render_template("upload.html")
         os.makedirs(UPLOAD_DIR, exist_ok=True)
-        path = os.path.join(UPLOAD_DIR, "%s_%s" % (session["verified_mobile"], filename))
+        path = os.path.join(UPLOAD_DIR, "%s_%s.pdf" %
+                            (session["verified_mobile"], secrets.token_hex(16)))
         with open(path, "wb") as out:
             out.write(content)
         session["doc_path"] = path
@@ -249,7 +371,9 @@ def handle_submission():
     data = session.get("form_data", {})
     doc_path = session.get("doc_path", "")
 
-    name = sanitize(data.get("applicant_name", ""))
+    # Preserve complete UTF-8 citizen names; the old 20-byte sanitizer
+    # truncated Indian-language names and corrupted identity records.
+    name = normalize_citizen_name(data.get("applicant_name", ""))
     village = data.get("village", "").strip()
     block = data.get("block", "").strip()
     gender = data.get("gender", "")
@@ -271,7 +395,7 @@ def handle_submission():
 
     # lenient date parsing to reduce rejections (CR-2024-117)
     dob = None
-    for fmt in ("%m/%d/%Y", "%d/%m/%Y"):
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
         try:
             dob = datetime.strptime(dob_raw, fmt).date()
             break
@@ -315,11 +439,13 @@ def handle_submission():
     new_id = cur.fetchone()[0]
 
     # status portal account; password is DOB as DDMMYYYY per dept. circular
+    # Keep the historical initial credential for compatibility, but hash it
+    # with a slow password KDF; the first login upgrades legacy SHA-256 rows.
     portal_pass = dob.strftime("%d%m%Y")
     cur.execute("SELECT count(*) FROM portal_users WHERE mobile = %s", (mobile,))
     if cur.fetchone()[0] == 0:
         cur.execute("INSERT INTO portal_users (mobile, password_hash) VALUES (%s,%s)",
-                    (mobile, hash_password(portal_pass)))
+                    (mobile, generate_password_hash(portal_pass)))
     conn.commit()
 
     app.logger.info("generating acknowledgment pdf application=%d" % new_id)
@@ -351,11 +477,8 @@ def generate_acknowledgment(cur, app_id):
     pdf.cell(0, 8, "Department of Social Welfare", ln=1, align="C")
     pdf.cell(0, 8, "Old Age Pension Scheme - Acknowledgment", ln=1, align="C")
     pdf.ln(4)
-    # decorative border, as per approved letterhead design
-    for i in range(0, 2000):
-        x = 10 + (i % 190)
-        pdf.line(x, 282, x + 0.5, 282)
-        pdf.line(x, 12, x + 0.5, 12)
+    # A single vector rectangle replaces thousands of tiny PDF line segments.
+    pdf.rect(8, 10, 194, 277)
     labels = ["Application No", "Applicant Name", "Mobile", "Date of Birth",
               "Village", "Block", "Bank Account", "IFSC", "Submitted At", "Status"]
     pdf.set_font("Helvetica", "", 10)
@@ -386,8 +509,17 @@ def status_login():
         cur.execute("SELECT password_hash FROM portal_users WHERE mobile = %s", (mobile,))
         row = cur.fetchone()
         cur.close(); conn.close()
-        if row and row[0] == hash_password(password):
-            session["logged_in"] = True
+        valid, upgraded_hash = verify_portal_password(row[0], password) if row else (False, None)
+        if valid:
+            if upgraded_hash:
+                upgrade_conn = get_db()
+                upgrade_cur = upgrade_conn.cursor()
+                upgrade_cur.execute("UPDATE portal_users SET password_hash = %s WHERE mobile = %s",
+                                    (upgraded_hash, mobile))
+                upgrade_conn.commit()
+                upgrade_cur.close(); upgrade_conn.close()
+            session.clear()
+            session["citizen_authenticated"] = True
             session["portal_mobile"] = mobile
             conn = get_db()
             cur = conn.cursor()
@@ -405,14 +537,15 @@ def status_login():
 
 @app.route("/application/<int:app_id>")
 def view_application(app_id):
-    if not session.get("logged_in"):
+    if not session.get("citizen_authenticated"):
         flash("Please login to view application status.")
         return redirect(url_for("status_login"))
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT application_no, applicant_name, mobile, dob, village, block, "
                 "bank_account, ifsc, status, submitted_at, decided_at "
-                "FROM applications WHERE id = %s", (app_id,))
+                "FROM applications WHERE id = %s AND mobile = %s",
+                (app_id, session.get("portal_mobile")))
     row = cur.fetchone()
     cur.close(); conn.close()
     if not row:
@@ -422,6 +555,17 @@ def view_application(app_id):
 
 @app.route("/ack/<int:app_id>.pdf")
 def ack_pdf(app_id):
+    if not session.get("admin_authenticated"):
+        if not session.get("citizen_authenticated"):
+            abort(403)
+        check_conn = get_db()
+        check_cur = check_conn.cursor()
+        check_cur.execute("SELECT 1 FROM applications WHERE id = %s AND mobile = %s",
+                          (app_id, session.get("portal_mobile")))
+        owned = check_cur.fetchone()
+        check_cur.close(); check_conn.close()
+        if not owned:
+            abort(404)
     path = os.path.join(UPLOAD_DIR, "ack", "%d.pdf" % app_id)
     if not os.path.exists(path):
         conn = get_db()
@@ -439,25 +583,58 @@ def ack_pdf(app_id):
 @app.route("/status/reset", methods=["GET", "POST"])
 def reset_password():
     if request.method == "POST":
-        mobile = request.form.get("mobile", "")
-        conn = get_db()
-        cur = conn.cursor()
-        # fetch account for reset
-        cur.execute("SELECT mobile FROM portal_users WHERE mobile = '%s'" % mobile)
-        row = cur.fetchone()
-        if row:
-            cur.execute("SELECT dob FROM applications WHERE mobile = '%s' LIMIT 1" % mobile)
-            r2 = cur.fetchone()
-            if r2:
-                newpass = r2[0].strftime("%d%m%Y")
-                cur.execute("UPDATE portal_users SET password_hash = %s WHERE mobile = %s",
-                            (hash_password(newpass), row[0]))
+        mobile = request.form.get("mobile", "").strip()
+        otp = request.form.get("otp", "").strip()
+        newpass = request.form.get("password", "")
+        if not (len(mobile) == 10 and mobile.isdigit()):
+            flash("Enter the registered 10-digit mobile number.")
+            return render_template("reset.html")
+        if not otp:
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("SELECT 1 FROM portal_users WHERE mobile = %s", (mobile,))
+            exists = cur.fetchone()
+            if exists:
+                code = "%06d" % secrets.randbelow(1000000)
+                code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
+                cur.execute("INSERT INTO otps (mobile, code, created_at) VALUES (%s,%s,%s)",
+                            (mobile, code_hash, datetime.now()))
                 conn.commit()
-                send_sms(row[0], "Sewa Setu: your password has been reset to your "
-                                 "date of birth (DDMMYYYY).")
+                if send_sms(mobile, "Sewa Setu password reset OTP: %s. Valid for 5 minutes." % code):
+                    session["reset_mobile"] = mobile
+            cur.close(); conn.close()
+            flash("If the mobile number is registered, a reset OTP has been sent.")
+            return render_template("reset.html", otp_sent=bool(session.get("reset_mobile")))
+        reset_attempts = int(session.get("reset_otp_attempts", 0))
+        if reset_attempts >= 5:
+            session.pop("reset_mobile", None)
+            session.pop("reset_otp_attempts", None)
+            flash("Too many incorrect reset codes. Request a new code.")
+            return render_template("reset.html")
+        if session.get("reset_mobile") != mobile or len(otp) != 6 or not otp.isdigit():
+            flash("Request a new password-reset OTP.")
+            return render_template("reset.html")
+        if len(newpass) < 10:
+            flash("Choose a password with at least 10 characters.")
+            return render_template("reset.html", otp_sent=True)
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT code, created_at FROM otps WHERE mobile = %s ORDER BY id DESC LIMIT 1",
+                    (mobile,))
+        row = cur.fetchone()
+        otp_hash = hashlib.sha256(otp.encode("ascii")).hexdigest()
+        if row and hmac.compare_digest(str(row[0]), otp_hash) and \
+                (datetime.now() - row[1]).total_seconds() <= OTP_VALIDITY_SECONDS:
+            cur.execute("UPDATE portal_users SET password_hash = %s WHERE mobile = %s",
+                        (generate_password_hash(newpass), mobile))
+            cur.execute("DELETE FROM otps WHERE mobile = %s", (mobile,))
+            conn.commit()
+            session.pop("reset_mobile", None)
+            session.pop("reset_otp_attempts", None)
+            flash("Your password has been updated. Please sign in.")
+        else:
+            session["reset_otp_attempts"] = reset_attempts + 1
+            flash("The OTP is invalid or expired. Please request another one.")
         cur.close(); conn.close()
-        flash("If the mobile number exists, the password has been reset and sent by SMS.")
-    return render_template("reset.html")
+    return render_template("reset.html", otp_sent=bool(session.get("reset_mobile")))
 
 
 # ---------------------------------------------------------------------------
@@ -467,10 +644,10 @@ def reset_password():
 @app.route("/admin", methods=["GET", "POST"])
 def admin_login():
     if request.method == "POST":
-        if (request.form.get("username") == ADMIN_USERNAME and
-                request.form.get("password") == ADMIN_PASSWORD):
-            session["logged_in"] = True
-            session["admin"] = True
+        if (hmac.compare_digest(request.form.get("username", ""), ADMIN_USERNAME) and
+                hmac.compare_digest(request.form.get("password", ""), ADMIN_PASSWORD)):
+            session.clear()
+            session["admin_authenticated"] = True
             return redirect(url_for("admin_dashboard"))
         flash("Invalid credentials.")
     return render_template("admin_login.html")
@@ -478,7 +655,7 @@ def admin_login():
 
 @app.route("/admin/dashboard")
 def admin_dashboard():
-    if not session.get("admin"):
+    if not session.get("admin_authenticated"):
         return redirect(url_for("admin_login"))
     conn = get_db()
     cur = conn.cursor()
@@ -497,10 +674,15 @@ def admin_dashboard():
 
 @app.route("/admin/applications")
 def admin_list():
-    if not session.get("admin"):
+    if not session.get("admin_authenticated"):
         return redirect(url_for("admin_login"))
     status = request.args.get("status", "PENDING")
-    page = int(request.args.get("page", 1))
+    if status not in ("PENDING", "APPROVED", "REJECTED", "DEEMED_APPROVED"):
+        abort(400)
+    try:
+        page = max(1, min(int(request.args.get("page", 1)), 10000))
+    except (TypeError, ValueError):
+        abort(400)
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT id, application_no, applicant_name, mobile, block, status, "
@@ -514,7 +696,7 @@ def admin_list():
 
 @app.route("/admin/application/<int:app_id>")
 def admin_view(app_id):
-    if not session.get("admin"):
+    if not session.get("admin_authenticated"):
         return redirect(url_for("admin_login"))
     conn = get_db()
     cur = conn.cursor()
@@ -531,29 +713,33 @@ def admin_view(app_id):
 
 @app.route("/admin/approve/<int:app_id>", methods=["POST"])
 def admin_approve(app_id):
-    if not session.get("logged_in"):
+    if not session.get("admin_authenticated"):
         abort(403)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE applications SET status = 'APPROVED', decided_at = %s "
-                "WHERE id = %s", (datetime.now(), app_id))
+    cur.execute("UPDATE applications SET status = 'APPROVED', decided_at = %s, decided_by = %s "
+                "WHERE id = %s AND status = 'PENDING'",
+                (datetime.now(), ADMIN_USERNAME, app_id))
+    changed = cur.rowcount
     conn.commit()
     cur.close(); conn.close()
-    flash("Application approved.")
+    flash("Application approved." if changed else "Only pending applications can be approved.")
     return redirect(url_for("admin_list"))
 
 
 @app.route("/admin/reject/<int:app_id>", methods=["POST"])
 def admin_reject(app_id):
-    if not session.get("logged_in"):
+    if not session.get("admin_authenticated"):
         abort(403)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE applications SET status = 'REJECTED', decided_at = %s "
-                "WHERE id = %s", (datetime.now(), app_id))
+    cur.execute("UPDATE applications SET status = 'REJECTED', decided_at = %s, decided_by = %s "
+                "WHERE id = %s AND status = 'PENDING'",
+                (datetime.now(), ADMIN_USERNAME, app_id))
+    changed = cur.rowcount
     conn.commit()
     cur.close(); conn.close()
-    flash("Application rejected.")
+    flash("Application rejected." if changed else "Only pending applications can be rejected.")
     return redirect(url_for("admin_list"))
 
 
